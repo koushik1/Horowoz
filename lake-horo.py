@@ -138,10 +138,11 @@ end = time.time()
 
 
 if hvd.rank() == 0: 
-    USend.assign(U[N/2:])
+    group = tf.group(USend.assign(U[N/2:]))
 else:
-    USend.assign(U[:N/2])
+    group = tf.group(USend.assign(U[:N/2]))
 
+group.run()
 
 bcast = tf.group(
   tf.assign(U[N/2:], hvd.broadcast(USend, 1)), 
