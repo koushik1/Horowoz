@@ -138,7 +138,7 @@ U_rank0_group = tf.group(
 #Copy the rest of U and Ut for rank 1
 U_rank1_group = tf.group(
       U_send.assign(U[:N/2]),
-      Ut_send[N/2:].assign(Ut[:N/2]))
+      Ut_send.assign(Ut[:N/2]))
 
 # Discretized PDE update rules
 U_ = U + eps * Ut
