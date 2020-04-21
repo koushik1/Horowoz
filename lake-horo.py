@@ -1,10 +1,5 @@
 #!/bin/python
 
-#Group info:
-#hmajety  Hari Krishna Majety
-#srout Sweta Rout
-#mreddy2 Muppidi Harshavardhan Reddy
-
 #Import libraries for simulation
 import tensorflow as tf
 import numpy as np
@@ -16,33 +11,34 @@ hvd.init()
 
 config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
-config.gpu_options.visible_device_list = str(hvd.local_rank())
+config.gpu_options.visible_device_list = '0'
 
-sess = tf.InteractiveSession()
-
-
+sess = tf.InteractiveSession() #CPU version
+#sess = tf.InteractiveSession(config=config) #Use only for capability 3.0 GPU
 
 #Imports for visualization
 import PIL.Image
 
-def DisplayArray(a, rank, fmt='jpeg', rng=[0,1]):
+def DisplayArray(a, fmt='jpeg', rng=[0,1]):
   """Display an array as a picture."""
-#  a = (a - rng[0])/float(rng[1] - rng[0])*255
-#  a = np.uint8(np.clip(a, 0, 255))
+  rank = hvd.rank()
+  jpg_file_name = "lake_py_" + str(rank) + ".jpg"
+  dat_file_name = "lake_c_" + str(rank) +".dat"
+
   global N
   h = float(1)/N
-  file1 = "lake_py_" + str(rank) +".jpg"
-  file2 = "lake_c_" + str(rank) +".dat"
-  with open(file2,'w') as f1:
+  with open(dat_file_name,'w') as f:
       for i in range(len(a)):
         for j in range(len(a[i])):
-          f1.write(str(i*h)+" "+str(j*h)+" "+str(a[i][j])+'\n')
+          f.write(str(i*h)+" "+str(j*h)+" "+str(a[i][j])+'\n')
+
   a = (a - rng[0])/float(rng[1] - rng[0])*255
   a = np.uint8(np.clip(a, 0, 255))
 
-  with open(file1,"w") as f:
+  with open(jpg_file_name,"w") as f:
       PIL.Image.fromarray(a).save(f, "jpeg")
 
+sess = tf.InteractiveSession()
 
 # Computational Convenience Functions
 def make_kernel(a):
@@ -68,15 +64,16 @@ def laplace(x):
   nine_point = [[0.25, 1.0, 0.25],
                 [1.00, -5., 1.00],
                 [0.25, 1.0, 0.25]]
-# 13 point stencil #
-  th_point = [[0.000,0.000,0.000,0.125,0.000,0.000,0.000],
+
+  thirteeen_point = [[0.000,0.000,0.000,0.125,0.000,0.000,0.000],
                     [0.000,0.000,0.000,0.250,0.000,0.000,0.000],
                     [0.000,0.000,0.000,1.000,0.000,0.000,0.000],
                     [0.125,0.250,1.000,-5.50,1.000,0.250,0.125],
                     [0.000,0.000,0.000,1.000,0.000,0.000,0.000],
                     [0.000,0.000,0.000,0.250,0.000,0.000,0.000],
-              [0.000,0.000,0.000,0.125,0.000,0.000,0.000]] 
-  laplace_k = make_kernel(th_point)
+                     [0.000,0.000,0.000,0.125,0.000,0.000,0.000]]
+   
+  laplace_k = make_kernel(thirteeen_point)
   return simple_conv(x, laplace_k)
 
 # Define the PDE
@@ -88,14 +85,16 @@ N = int(sys.argv[1])
 npebs = int(sys.argv[2])
 num_iter = int(sys.argv[3])
 
+send_buf = np.zeros([N, N], dtype=np.float32)
+recv0_buf = np.zeros([N, N], dtype=np.float32)
+recv1_buf = np.zeros([N, N], dtype=np.float32)
+
+if hvd.rank() == 0:
+  print("Rank " + str(hvd.rank()) + " recv initial: "+str(recv0_buf))
+else:
+  print "Rank "+str(hvd.rank())+" recv initial: "+str(recv1_buf)
+
 # Initial Conditions -- some rain drops hit a pond
-
-# Create buffer
-#Ur0_buf  = np.zeros([3][N], dtype=np.float32)
-#Utr0_buf  = np.zeros([3][N], dtype=np.float32)
-#Ur1_buf  = np.zeros([3][N] , dtype=np.float32)
-#Utr1_buf  = np.zeros([3] [N], dtype=np.float32)
-
 
 # Set everything to zero
 u_init  = np.zeros([N, N], dtype=np.float32)
@@ -115,60 +114,15 @@ damping = tf.placeholder(tf.float32, shape=())
 # Create variables for simulation state
 U  = tf.Variable(u_init)
 Ut = tf.Variable(ut_init)
-U_Send  = tf.Variable(u_init,  name='U_Send')
-Ut_Send  = tf.Variable(ut_init,  name='Ut_Send')
-
-# Create tensor flow variable to receive into
-Ur0 = tf.Variable(np.zeros([3, N], dtype=np.float32))
-Utr0 = tf.Variable(np.zeros([3, N], dtype=np.float32))
-Ur1 = tf.Variable(np.zeros([3, N], dtype=np.float32))
-Utr1 = tf.Variable(np.zeros([3, N], dtype=np.float32))
-
-
-#Used for calculations
-U_main = tf.Variable(np.zeros([N+3, N], dtype=np.float32))
-Ut_main = tf.Variable(np.zeros([N+3, N], dtype=np.float32))
-
-
-#Communicate 3 rows
-rank_bcast = tf.group(
-  tf.assign(Ur0, hvd.broadcast(U[:3], 1)),  #Rank 1's send_buffer to Rank 0's recv for U
-  tf.assign(Utr0, hvd.broadcast(Ut[:3], 1)),  #Rank 1's send_buffer to Rank 0's recv for Ut
-  tf.assign(Ur1, hvd.broadcast(U[-3:], 0)),  #Rank 0's send_buffer to Rank 1's recv for U
-  tf.assign(Utr1, hvd.broadcast(Ut[-3:], 0)))  #Rank 0's send_buffer to Rank 1's recv for Ut
-
-rank0_join = tf.group(                         
-    U_main.assign(tf.concat([U, Ur0], 0)),
-    Ut_main.assign(tf.concat([Ut, Utr0], 0)))
-
-rank1_join = tf.group(
-      U_main.assign((tf.concat([ Ur1,U], 0))),
-      Ut_main.assign((tf.concat([Utr1,Ut],0))
-      ))
-    
-
 
 # Discretized PDE update rules
-U_ = U_main + eps * Ut_main
-Ut_ = Ut_main + eps * (laplace(U_main) - damping * Ut_main)
-
+U_ = U + eps * Ut
+Ut_ = Ut + eps * (laplace(U) - damping * Ut)
 
 # Operation to update the state
 step = tf.group(
-  U_main.assign(U_),
-  Ut_main.assign(Ut_))
-
-
-#Operation to extract back the actual size
-rank0_extract1 = tf.group(
-  U.assign(tf.slice(U_main,[0,0],[N,N])))
-rank0_extract2 = tf.group(
-  Ut.assign(tf.slice(Ut_main,[0,0],[N,N])))
-
-rank1_extract1 = tf.group(
-  U.assign(tf.slice(U_main,[3,0],[N,N])))
-rank1_extract2 = tf.group(
-  Ut.assign(tf.slice(Ut_main,[3,0],[N,N])))
+  U.assign(U_),
+  Ut.assign(Ut_))
 
 # Initialize state to initial conditions
 tf.global_variables_initializer().run()
@@ -177,26 +131,29 @@ tf.global_variables_initializer().run()
 start = time.time()
 for i in range(num_iter):
   # Step simulation
-  rank_bcast.run()          #Broadcast
-  if hvd.rank() == 0:        #Attaching the rows which they get
-      rank0_join.run()    
-  else:
-      rank1_join.run()
-  step.run({eps: 0.06, damping: 0.03})    #Calculation
-  if hvd.rank() == 0:           #Dettaching the extra rows
-      rank0_extract1.run()
-      rank0_extract2.run()
-  else:
-      rank1_extract1.run()
-      rank1_extract2.run()
+  step.run({eps: 0.06, damping: 0.03})
 
 end = time.time()
-print('Elapsed time: {} seconds'.format(end - start))  
 
-if hvd.rank() == 0:                               #For genrating the desired files and jpegs.
-  DisplayArray(U.eval(), 0, rng=[-0.1, 0.1])
+USend = tf.Variable(np.zeros([N/2, N], dtype=np.float32))
+
+if hvd.rank() == 0: 
+    USend.assign(U[N/2:])
 else:
-  DisplayArray(U.eval(), 1, rng=[-0.1, 0.1])
+    USend.assign(U[:N/2])
 
 
-#DisplayArray(U.eval(), rng=[-0.1, 0.1])
+bcast = tf.group(
+  tf.assign(U[N/2:], hvd.broadcast(USend, 1)), 
+  tf.assign(U[:N/2], hvd.broadcast(USend, 0)))
+
+# Initialize state to initial conditions
+tf.global_variables_initializer().run() 
+
+bcast.run()
+
+print('Elapsed time: {} seconds'.format(end - start))
+
+# from here we send our data to the other node
+
+DisplayArray(U.eval(), rng=[-0.1, 0.1])
