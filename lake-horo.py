@@ -85,24 +85,16 @@ N = int(sys.argv[1])
 npebs = int(sys.argv[2])
 num_iter = int(sys.argv[3])
 
-send_buf = np.zeros([N, N], dtype=np.float32)
-recv0_buf = np.zeros([N, N], dtype=np.float32)
-recv1_buf = np.zeros([N, N], dtype=np.float32)
-
-if hvd.rank() == 0:
-  print("Rank " + str(hvd.rank()) + " recv initial: "+str(recv0_buf))
-else:
-  print "Rank "+str(hvd.rank())+" recv initial: "+str(recv1_buf)
-
 # Initial Conditions -- some rain drops hit a pond
 
 # Set everything to zero
-u_init  = np.zeros([N, N], dtype=np.float32)
-ut_init = np.zeros([N, N], dtype=np.float32)
+u_init  = np.zeros([N/2, N], dtype=np.float32)
+ut_init = np.zeros([N/2, N], dtype=np.float32)
 
 # Some rain drops hit a pond at random points
 for n in range(npebs):
-  a,b = np.random.randint(0, N, 2)
+  a = np.random.randint(0, N/2)
+  b = np.random.randint(0, N)
   u_init[a,b] = np.random.uniform()
 
 # Parameters:
@@ -115,51 +107,47 @@ damping = tf.placeholder(tf.float32, shape=())
 U  = tf.Variable(u_init)
 Ut = tf.Variable(ut_init)
 
-
 #The complete 3N/2 * N matrices on which we'll perform calculations
-#U_full = tf.Variable(np.zeros([(3*N)/2, N], dtype=np.float32))          
-#Ut_full = tf.Variable(np.zeros([(3*N)/2, N], dtype=np.float32))
-U_send = tf.Variable(np.zeros([(N)/2, N], dtype=np.float32))          
-Ut_send = tf.Variable(np.zeros([(N)/2, N], dtype=np.float32))          
-
+U_full = tf.Variable(np.zeros([(N/2) + 3, N], dtype=np.float32))          
+Ut_full = tf.Variable(np.zeros([(N/2) + 3, N], dtype=np.float32))
 
 
 rank_bcast = tf.group(
-  tf.assign(U[:N/2], hvd.broadcast(U_send, 1)),  #Sending 1st half of rank 1 to rank 0 for U
-  tf.assign(Ut[:N/2], hvd.broadcast(Ut_send, 1)),  #Sending 1st half of rank 1 to rank 0 for Ut
-  tf.assign(U[N/2:], hvd.broadcast(U_send, 0)),  #Sending 2nd half of rank 0 to rank 1 for U
-  tf.assign(Ut[N/2:], hvd.broadcast(Ut_send, 0)))  #Sending 2nd half of rank 0 to rank 1 for Ut
+  tf.assign(U_full[N/2:], hvd.broadcast(U[:3], 1)),  #Sending first 3 rows of rank 1 to rank 0 for U
+  tf.assign(Ut_full[N/2:], hvd.broadcast(Ut[:3], 1)),  #Sending first 3 rows of rank 1 to rank 0 for Ut
+  tf.assign(U_full[:3], hvd.broadcast(U[-3:], 0)),  #Sending last 3 rows of rank 0 to rank 1 for U
+  tf.assign(Ut_full[:3], hvd.broadcast(Ut[-3:], 0)))  #Sending 2nd half of rank 0 to rank 1 for Ut
 
 #Copy the rest of U and Ut for rank 0
-U_rank0_group = tf.group(                         
-    U_send.assign(U[N/2:]),
-    Ut_send.assign(Ut[N/2:]))
+U_full_rank0_group = tf.group(                         
+    U_full[:N/2].assign(U),
+    Ut_full[:N/2].assign(Ut))
 
 #Copy the rest of U and Ut for rank 1
-U_rank1_group = tf.group(
-      U_send.assign(U[:N/2]),
-      Ut_send.assign(Ut[:N/2]))
+U_full_rank1_group = tf.group(
+      U_full[3:].assign(U),
+      Ut_full[3:].assign(Ut))
 
 # Discretized PDE update rules
-U_ = U + eps * Ut
-Ut_ = Ut + eps * (laplace(U) - damping * Ut)
+U_ = U_full + eps * Ut_full
+Ut_ = Ut_full + eps * (laplace(U_full) - damping * Ut_full)
 
 
 # Operation to update the state
 step = tf.group(
-  U.assign(U_),
-  Ut.assign(Ut_))
+  U_full.assign(U_),
+  Ut_full.assign(Ut_))
 
 
 #Get the matrix U and Ut from U_full and Ut_full for rank 0
-#rank0_extract = tf.group(
-  #U.assign(tf.slice(U_full,[0,0],[N,N])),
-  #Ut.assign(tf.slice(Ut_full,[0,0],[N,N])))
+rank0_extract = tf.group(
+  U.assign(tf.slice(U_full,[0,0],[N/2,N])),
+  Ut.assign(tf.slice(Ut_full,[0,0],[N/2,N])))
 
 #Get the matrix U and Ut from U_full and Ut_full for rank 1
-#rank1_extract = tf.group(
-  #U.assign(tf.slice(U_full,[N/2,0],[N,N])),
-  #Ut.assign(tf.slice(Ut_full,[N/2,0],[N,N])))
+rank1_extract = tf.group(
+  U.assign(tf.slice(U_full,[3,0],[N/2,N])),
+  Ut.assign(tf.slice(Ut_full,[3,0],[N/2,N])))
 
 # Initialize state to initial conditions
 tf.global_variables_initializer().run()
@@ -168,14 +156,19 @@ tf.global_variables_initializer().run()
 start = time.time()
 for i in range(num_iter):
   # Step simulation
-  if hvd.rank() == 0:      # Fill out the rest of the values for U_full and Ut_full
-      U_rank0_group.run()    
-  else:
-      U_rank1_group.run()
-
   rank_bcast.run()      #Send the upper and lower values for rank 1 and 0 respectively for matrix U and Ut
 
+  if hvd.rank() == 0:      # Fill out the rest of the values for U_full and Ut_full
+      U_full_rank0_group.run()    
+  else:
+      U_full_rank1_group.run()
+
   step.run({eps: 0.06, damping: 0.03})    
+
+  if hvd.rank() == 0:           #Extract U and Ut from Ufull and Utfull
+      rank0_extract.run()
+  else:
+      rank1_extract.run()
 
 end = time.time()
 
