@@ -114,6 +114,7 @@ damping = tf.placeholder(tf.float32, shape=())
 # Create variables for simulation state
 U  = tf.Variable(u_init)
 Ut = tf.Variable(ut_init)
+USend = tf.Variable(np.zeros([N/2, N], dtype=np.float32))
 
 # Discretized PDE update rules
 U_ = U + eps * Ut
@@ -135,7 +136,6 @@ for i in range(num_iter):
 
 end = time.time()
 
-USend = tf.Variable(np.zeros([N/2, N], dtype=np.float32))
 
 if hvd.rank() == 0: 
     USend.assign(U[N/2:])
@@ -147,8 +147,6 @@ bcast = tf.group(
   tf.assign(U[N/2:], hvd.broadcast(USend, 1)), 
   tf.assign(U[:N/2], hvd.broadcast(USend, 0)))
 
-# Initialize state to initial conditions
-tf.global_variables_initializer().run() 
 
 bcast.run()
 
