@@ -114,16 +114,44 @@ damping = tf.placeholder(tf.float32, shape=())
 # Create variables for simulation state
 U  = tf.Variable(u_init)
 Ut = tf.Variable(ut_init)
-USend = tf.Variable(np.zeros([N/2, N], dtype=np.float32))
+
+U_full = tf.Variable(np.zeros([(3*N)/2, N], dtype=np.float32))
+Ut_full = tf.Variable(np.zeros([(3*N)/2, N], dtype=np.float32))
+
+
+rank_bcast = tf.group(
+  tf.assign(U_full[N:], hvd.broadcast(U[:N/2], 1)),  
+  tf.assign(Ut_full[N:], hvd.broadcast(Ut[:N/2], 1)),  
+  tf.assign(U_full[:N/2], hvd.broadcast(U[N/2:], 0)),  
+  tf.assign(Ut_full[:N/2], hvd.broadcast(Ut[N/2:], 0)))  
+
+U_full_rank0_group = tf.group(                         
+    U_full[:N].assign(U),
+    Ut_full[:N].assign(Ut))
+
+U_full_rank1_group = tf.group(
+      U_full[N/2:].assign(U),
+      Ut_full[N/2:].assign(Ut))
 
 # Discretized PDE update rules
-U_ = U + eps * Ut
-Ut_ = Ut + eps * (laplace(U) - damping * Ut)
+U_ = U_full + eps * Ut_full
+Ut_ = Ut_full + eps * (laplace(U_full) - damping * Ut_full)
+
 
 # Operation to update the state
 step = tf.group(
-  U.assign(U_),
-  Ut.assign(Ut_))
+  U_full.assign(U_),
+  Ut_full.assign(Ut_))
+
+
+#Operation to extract back the actual size
+rank0_extract = tf.group(
+  U.assign(tf.slice(U_full,[0,0],[N,N])),
+  Ut.assign(tf.slice(Ut_full,[0,0],[N,N])))
+
+rank1_extract = tf.group(
+  U.assign(tf.slice(U_full,[N/2,0],[N,N])),
+  Ut.assign(tf.slice(Ut_full,[N/2,0],[N,N])))
 
 # Initialize state to initial conditions
 tf.global_variables_initializer().run()
@@ -132,24 +160,21 @@ tf.global_variables_initializer().run()
 start = time.time()
 for i in range(num_iter):
   # Step simulation
-  step.run({eps: 0.06, damping: 0.03})
+  rank_bcast.run()         
+  if hvd.rank() == 0:       
+      U_full_rank0_group.run()    
+  else:
+      U_full_rank1_group.run()
+
+  step.run({eps: 0.06, damping: 0.03})    
+
+  if hvd.rank() == 0:           
+      rank0_extract.run()
+  else:
+      rank1_extract.run()
 
 end = time.time()
 
-
-if hvd.rank() == 0: 
-    group = tf.group(USend.assign(U[N/2:]))
-else:
-    group = tf.group(USend.assign(U[:N/2]))
-
-group.run()
-
-bcast = tf.group(
-  tf.assign(U[N/2:], hvd.broadcast(USend, 1)), 
-  tf.assign(U[:N/2], hvd.broadcast(USend, 0)))
-
-
-bcast.run()
 
 print('Elapsed time: {} seconds'.format(end - start))
 
